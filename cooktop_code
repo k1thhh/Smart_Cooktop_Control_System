@@ -1,0 +1,249 @@
+#include <Wire.h> 
+#include <Adafruit_SSD1306.h> 
+#include <Adafruit_MLX90614.h> 
+ 
+// all pins info 
+// oled 
+#define screenwidth 128 
+#define screenheight 64 
+#define reset    -1 
+TwoWire oledWire = TwoWire(1);   
+Adafruit_SSD1306 display(screenwidth, screenheight, &oledWire, reset); 
+// ultrasonic sensor 
+const int trigPin = 19; 
+const int echoPin = 2; 
+//others 
+const int relayPin = 4; 
+const int buzzerPin = 18; 
+const int CALIB_BTN = 13; 
+// motor driver 
+const int motorIn1 = 15; 
+const int motorIn2 = 12; 
+const int motorENA = 5; 
+// temperature sensor 
+Adafruit_MLX90614 mlx = Adafruit_MLX90614(); 
+const float tempthreshold = 80.0; 
+ 
+//variables 
+float baseHeight = 17.0; //depends on the setup 
+float vesselHeight = 0; 
+float currentDistance = 0; 
+float foodHeight = 0; 
+bool vesselCalibrated = false; 
+bool monitoringStarted = false; 
+24 
+ 
+bool overflow = false; 
+bool secondPressReady = false; 
+const float heightbuffer = 4.0; 
+ 
+//motor variables 
+unsigned long lastMotorRunTime = 0; 
+const unsigned long motorInterval = 10000; // 10 seconds 
+const unsigned long motorRunDuration = 5000; // 5 second 
+bool motorRunning = false; 
+unsigned long motorStartTime = 0; 
+ 
+ 
+void setup() { 
+  Serial.begin(115200); 
+ 
+  //pin modes 
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT); 
+  pinMode(relayPin, OUTPUT); 
+  pinMode(buzzerPin, OUTPUT); 
+  pinMode(CALIB_BTN, INPUT_PULLUP); 
+ 
+  pinMode(motorIn1, OUTPUT); 
+  pinMode(motorIn2, OUTPUT); 
+  pinMode(motorENA, OUTPUT); 
+  digitalWrite(motorIn1, LOW); 
+  digitalWrite(motorIn2, LOW); 
+  digitalWrite(motorENA, LOW); 
+ 
+  digitalWrite(relayPin, HIGH); 
+  digitalWrite(buzzerPin, LOW); 
+ 
+  // OLED and Temp sensor 
+  oledWire.begin(32, 33); 
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println("OLED initialization failed"); 
+    while (true); 
+25 
+ 
+  } 
+ 
+  if (!mlx.begin()) { 
+    Serial.println("MLX90614 not detected"); 
+    while (true); 
+  } 
+ 
+  display.clearDisplay(); 
+  display.setTextSize(1); 
+  display.setTextColor(SSD1306_WHITE); 
+  display.setCursor(0, 0); 
+  display.println("System Starting..."); 
+  display.display(); 
+  delay(1500); 
+} 
+ 
+void loop() { 
+  // vessel height calibaration 
+  if (!vesselCalibrated && digitalRead(CALIB_BTN) == LOW) { 
+    calibrateVesselHeight(); 
+    secondPressReady = true; 
+    delay(1000); // debounce 
+  } 
+ 
+  // condition for 2nd stage(food height) 
+  if (vesselCalibrated && secondPressReady && digitalRead(CALIB_BTN) == 
+LOW) { 
+    monitoringStarted = true; 
+    secondPressReady = false; 
+    delay(1000); // debounce 
+  } 
+ 
+  // monitoring food height 
+  if (monitoringStarted) { 
+    currentDistance = measuredistance(); 
+    foodHeight = vesselHeight - currentDistance; 
+    float temp = mlx.readObjectTempC(); 
+26 
+ 
+ 
+    checkoverflow(foodHeight, temp); 
+    managemotor(); 
+    updatedisplay(foodHeight, temp); 
+  } 
+ 
+  delay(500); 
+} 
+ 
+// distance measurement 
+float measuredistance() { 
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(2); 
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10); 
+  digitalWrite(trigPin, LOW); 
+  long duration = pulseIn(echoPin, HIGH, 30000); 
+  float distance = duration * 0.034 / 2; 
+  return distance > 0 ? distance : 500.0; 
+} 
+ 
+// vessel height calibration 
+void calibrateVesselHeight() { 
+  display.clearDisplay(); 
+  display.setCursor(0, 0); 
+  display.println("Calibrating..."); 
+  display.display(); 
+  delay(1000); 
+ 
+  float sum = 0; 
+  for (int i = 0; i < 3; i++) { 
+    sum += measuredistance(); 
+    delay(200); 
+  } 
+  float plateDistance = sum / 3.0; 
+  vesselHeight = baseHeight - plateDistance; 
+  vesselCalibrated = true; 
+27 
+ 
+ 
+  Serial.print("Vessel Height: "); 
+  Serial.println(vesselHeight); 
+ 
+  display.clearDisplay(); 
+  display.setCursor(0, 0); 
+  display.println("Calibrated!"); 
+  display.print("Vessel Height: "); 
+  display.print(vesselHeight, 1); 
+  display.println(" cm"); 
+  display.display(); 
+  delay(2000); 
+} 
+ 
+// overflow check 
+void checkoverflow(float foodHeight, float temp) { 
+  float thresholdHeight = vesselHeight - heightbuffer; 
+ 
+  if (foodHeight > thresholdHeight || temp > tempthreshold) { 
+    if (!overflow) { 
+      overflow = true; 
+      digitalWrite(relayPin, LOW); 
+      digitalWrite(buzzerPin, HIGH); 
+      stopMotor(); 
+      Serial.println("OVERFLOW DETECTED (HEIGHT or TEMP)"); 
+    } 
+  } else { 
+    if (overflow) { 
+      overflow = false; 
+      digitalWrite(relayPin, HIGH); 
+      digitalWrite(buzzerPin, LOW); 
+      Serial.println("Safe again"); 
+    } 
+  } 
+} 
+ 
+// motor control 
+28 
+ 
+void managemotor() { 
+  unsigned long now = millis(); 
+ 
+  if (overflow) { 
+    stopMotor(); 
+    return; 
+  } 
+ 
+  if (!motorRunning && now - lastMotorRunTime >= motorInterval) { 
+    motorRunning = true; 
+    motorStartTime = now; 
+ 
+    digitalWrite(motorIn1, HIGH); 
+    digitalWrite(motorIn2, LOW); 
+    digitalWrite(motorENA, HIGH); 
+    Serial.println("Motor ON"); 
+  } 
+ 
+  if (motorRunning && now - motorStartTime >= motorRunDuration) { 
+    stopMotor(); 
+    lastMotorRunTime = now; 
+    motorRunning = false; 
+    Serial.println("Motor OFF"); 
+  } 
+} 
+ 
+void stopMotor() { 
+  digitalWrite(motorIn1, LOW); 
+  digitalWrite(motorIn2, LOW); 
+  digitalWrite(motorENA, LOW); 
+} 
+ 
+// === OLED DISPLAY === 
+void updatedisplay(float foodHeight, float temp) { 
+  display.clearDisplay(); 
+  display.setCursor(0, 0); 
+  display.print("Vessel Height: "); 
+29 
+ 
+  display.print(vesselHeight, 1); 
+  display.println(" cm"); 
+ 
+  display.print("Food Height: "); 
+  display.print(foodHeight, 1); 
+  display.println(" cm"); 
+ 
+  display.print("Temp: "); 
+  display.print(temp, 1); 
+  display.println(" C"); 
+ 
+  if (overflow) { 
+    display.println("Status:OVERFLOW"); 
+  } else { 
+    display.println("Status:OK"); 
+  } 
+ 
+  display.display(); 
+}
